@@ -6,12 +6,16 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
+	"sync/atomic"
 )
 
 type Backend struct {
 	URL          *url.URL
 	Alive        bool
 	ReverseProxy *httputil.ReverseProxy
+
+	mux sync.RWMutex
 }
 
 func newBackend(urlStr string) *Backend {
@@ -28,7 +32,17 @@ func newBackend(urlStr string) *Backend {
 }
 
 func (b *Backend) IsAlive() bool {
+	b.mux.RLock()
+	defer b.mux.RUnlock()
+
 	return b.Alive
+}
+
+func (b *Backend) SetAlive(alive bool) {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+
+	b.Alive = alive
 }
 
 type ServerPool struct {
@@ -37,44 +51,48 @@ type ServerPool struct {
 }
 
 func (s *ServerPool) Next() *Backend {
-	// Round-robin balancing
 	current := atomic.AddUint64(&s.current, 1)
 
-	backend := s.Backends[(current-1)%uint64(len(s.Backends))]
+	for i := 0; i < len(s.Backends); i++ {
+		index := int(current+uint64(i)) % len(s.Backends)
 
-	return backend
-}
+		backend := s.Backends[index]
 
-func startBackend(port string) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Hello from backend %s\n", port)
-	})
-
-	log.Printf("Backend running on port %s", port)
-
-	err := http.ListenAndServe(":"+port, handler)
-	if err != nil {
-		log.Fatal(err)
+		if backend.IsAlive() {
+			return backend
+		}
 	}
+
+	return nil
 }
 
 func main() {
-	// Start our fake backend servers.
-	go startBackend("8081")
-	go startBackend("8082")
-	go startBackend("8083")
-
-	serverPool := &ServerPool{
-		Backends: []*Backend{
-			newBackend("http://localhost:8081"),
-			newBackend("http://localhost:8082"),
-			newBackend("http://localhost:8083"),
-		},
+	config, err := loadConfig("config.json")
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	// Probably should refactor this outside
+	serverPool := &ServerPool{}
+
+	for _, backendURL := range config.Backends {
+		// Create the LB's representation of this backend.
+		serverPool.Backends = append(
+			serverPool.Backends,
+			newBackend(backendURL),
+		)
+	}
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		backend := serverPool.Next()
+
+		if backend == nil {
+			http.Error(
+				w,
+				"No healthy backends available",
+				http.StatusServiceUnavailable,
+			)
+			return
+		}
 
 		fmt.Println(
 			"Proxying request to backend:",
@@ -84,7 +102,12 @@ func main() {
 		backend.ReverseProxy.ServeHTTP(w, r)
 	})
 
-	log.Println("Load balancer running on port 8080")
+	log.Printf("Load balancer running on port %d", config.Port)
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(
+		http.ListenAndServe(
+			fmt.Sprintf(":%d", config.Port),
+			nil,
+		),
+	)
 }
